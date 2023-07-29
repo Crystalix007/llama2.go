@@ -4,7 +4,9 @@ go 1.19
 
 require (
 	github.com/haormj/version v1.0.0
+	github.com/passkeyra/go-opencl v0.0.0-20220406222639-89fc1cb60037
 	github.com/spf13/cobra v0.0.5
+	gitlab.com/microo8/blackcl v0.0.0-20190218100333-2c95478cf9bd
 )
 
 require (

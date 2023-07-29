@@ -9,8 +9,11 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime/pprof"
 	"time"
 
+	"github.com/haormj/llama2/accelerated"
+	"github.com/haormj/llama2/accelerated/blackcl"
 	"github.com/spf13/cobra"
 )
 
@@ -93,6 +96,16 @@ var runCmd = &cobra.Command{
 
 		state := NewRunState(config)
 
+		if err = state.backend.SetupContext(); err != nil {
+			log.Fatalln(err)
+		}
+
+		prof, err := os.Create("cpuprofile.prof")
+		if err != nil {
+			log.Fatalln(err)
+		}
+		pprof.StartCPUProfile(prof)
+
 		start := time.Now().UnixMilli()
 		var next, pos int
 		var token int = 1
@@ -115,6 +128,8 @@ var runCmd = &cobra.Command{
 			pos++
 		}
 		end := time.Now().UnixMilli()
+		pprof.StopCPUProfile()
+
 		fmt.Printf("\nachieved tok/s: %f", float64(config.seq_len)/float64(end-start)*1000.0)
 	},
 }
@@ -269,6 +284,8 @@ type RunState struct {
 	// kv cache
 	key_cache   []float32 // (layer, seq_len, dim)
 	value_cache []float32 // (layer, seq_len, dim)
+
+	backend accelerated.Backend
 }
 
 func NewRunState(p *Config) *RunState {
@@ -285,6 +302,7 @@ func NewRunState(p *Config) *RunState {
 		logits:      make([]float32, p.vocab_size),
 		key_cache:   make([]float32, p.n_layers*p.seq_len*p.dim),
 		value_cache: make([]float32, p.n_layers*p.seq_len*p.dim),
+		backend:     blackcl.New(),
 	}
 }
 
@@ -329,14 +347,9 @@ func softmax(x []float32, size int) {
 	}
 }
 
-func matmul(xout, x, w []float32, n, d int) {
-	// W (d,n) @ x (n,) -> xout (d,)
-	for i := 0; i < d; i++ {
-		var val float32
-		for j := 0; j < n; j++ {
-			val += w[i*n+j] * x[j]
-		}
-		xout[i] = val
+func (rs *RunState) matmul(xout, x, w []float32, n, d int) {
+	if err := rs.backend.MatMul(xout, x, w, n, d); err != nil {
+		panic(err)
 	}
 }
 
@@ -362,9 +375,9 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 		rmsnorm(s.xb, x, w.rms_att_weight[l*dim:], dim)
 
 		// qkv matmuls for this position
-		matmul(s.q, s.xb, w.wq[l*dim*dim:], dim, dim)
-		matmul(s.k, s.xb, w.wk[l*dim*dim:], dim, dim)
-		matmul(s.v, s.xb, w.wv[l*dim*dim:], dim, dim)
+		s.matmul(s.q, s.xb, w.wq[l*dim*dim:], dim, dim)
+		s.matmul(s.k, s.xb, w.wk[l*dim*dim:], dim, dim)
+		s.matmul(s.v, s.xb, w.wv[l*dim*dim:], dim, dim)
 
 		// apply RoPE rotation to the q and k vectors for each head
 		for h := 0; h < int(p.n_heads); h++ {
@@ -427,7 +440,7 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 		}
 
 		// final matmul to get the output of the attention
-		matmul(s.xb2, s.xb, w.wo[l*dim*dim:], dim, dim)
+		s.matmul(s.xb2, s.xb, w.wo[l*dim*dim:], dim, dim)
 
 		// residual connection back into x
 		accum(x, s.xb2, dim)
@@ -437,8 +450,8 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 
 		// Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
 		// first calculate self.w1(x) and self.w3(x)
-		matmul(s.hb, s.xb, w.w1[l*dim*hidden_dim:], dim, hidden_dim)
-		matmul(s.hb2, s.xb, w.w3[l*dim*hidden_dim:], dim, hidden_dim)
+		s.matmul(s.hb, s.xb, w.w1[l*dim*hidden_dim:], dim, hidden_dim)
+		s.matmul(s.hb2, s.xb, w.w3[l*dim*hidden_dim:], dim, hidden_dim)
 
 		// F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
 		for i := 0; i < hidden_dim; i++ {
@@ -451,7 +464,7 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 		}
 
 		// final matmul to get the output of the ffn
-		matmul(s.xb, s.hb, w.w2[l*dim*hidden_dim:], hidden_dim, dim)
+		s.matmul(s.xb, s.hb, w.w2[l*dim*hidden_dim:], hidden_dim, dim)
 
 		// residual connection
 		accum(x, s.xb, dim)
@@ -461,7 +474,7 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 	rmsnorm(x, x, w.rms_final_weight, dim)
 
 	// classifier into logits
-	matmul(s.logits, x, w.wcls, int(p.dim), int(p.vocab_size))
+	s.matmul(s.logits, x, w.wcls, int(p.dim), int(p.vocab_size))
 }
 
 func sample(probabilities []float32, n int) int {
