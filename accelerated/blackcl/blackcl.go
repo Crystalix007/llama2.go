@@ -11,6 +11,8 @@ import (
 //go:embed matmul.cl
 var matmulSrc string
 
+const localGroupSize = 64
+
 type OpenCL struct {
 	device *blackcl.Device
 	kernel *blackcl.Kernel
@@ -93,7 +95,15 @@ func (o *OpenCL) MatMul(xout []float32, x []float32, w []float32, n int, d int) 
 		return fmt.Errorf("accelerated/blackcl: failed to copy w to device: %w", err)
 	}
 
-	if err = <-o.kernel.Global(d).Local(1).Run(xoutDev, xDev, wDev, uint32(n)); err != nil {
+	globalSize := d
+	localSize := 1
+
+	if globalSize%localGroupSize != 0 {
+		globalSize /= localGroupSize
+		localSize = localGroupSize
+	}
+
+	if err = <-o.kernel.Global(globalSize).Local(localSize).Run(xoutDev, xDev, wDev, uint32(n)); err != nil {
 		return fmt.Errorf("accelerated/blackcl: failed to run kernel: %w", err)
 	}
 

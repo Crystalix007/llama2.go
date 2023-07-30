@@ -1,5 +1,5 @@
 kernel void matmul(global float *out, global float *x, global float *w, int n) {
-  const size_t i = get_global_id(0);
+  const size_t i = get_global_id(0) * get_local_size(0) + get_local_size(0);
 
   float val = 0;
 
