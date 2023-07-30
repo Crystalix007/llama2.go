@@ -1,13 +1,16 @@
 # llama2.go
 
-ref [llama2.c](https://github.com/karpathy/llama2.c), golang version
+A golang reimplementation of [llama2.c](https://github.com/karpathy/llama2.c),
+with OpenCL support.
 
 
 ## Usage
 
 ```bash
+# download model.bin and tokenizer.bin to _output from
+# https://github.com/karpathy/llama2.c
+
 make
-# download model.bin and tokenizer.bin to _output from https://github.com/karpathy/llama2.c
 cd _output
 ./llama2 run
 ```

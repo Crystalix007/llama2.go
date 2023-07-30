@@ -8,7 +8,7 @@ export GOENV = ${workingDirectory}/go.env
 
 all: build
 
-build: 
+build:
 	@buildTime=`date "+%Y-%m-%d %H:%M:%S"`; \
 	go build -ldflags "-X '${versionPath}.Version=${version}' \
 	                   -X '${versionPath}.BuildTime=$$buildTime' \
