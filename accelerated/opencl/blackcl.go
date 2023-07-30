@@ -1,4 +1,4 @@
-package blackcl
+package opencl
 
 import (
 	_ "embed"
@@ -41,7 +41,7 @@ func (o *OpenCL) Release() error {
 	return nil
 }
 
-func (o *OpenCL) Buffer(bufferTag string, size int) (*blackcl.Vector, error) {
+func (o *OpenCL) AllocBuffer(bufferTag string, size int) (*blackcl.Vector, error) {
 	if _, ok := o.bufferCache[bufferTag]; !ok {
 		o.bufferCache[bufferTag] = make(map[int]*blackcl.Vector)
 	}
@@ -62,25 +62,60 @@ func (o *OpenCL) Buffer(bufferTag string, size int) (*blackcl.Vector, error) {
 	return buffer, nil
 }
 
+// Buffer asynchronously buffers a slice of float32s onto the device.
+// Returns a channel of errors that will report when the buffer is done
+// copying, or any errors that occurred.
+func (o *OpenCL) Buffer(vals []float32) (*blackcl.Vector, <-chan error) {
+	errChan := make(chan error, 1)
+
+	buffer, err := o.device.NewVector(len(vals))
+	if err != nil {
+		errChan <- fmt.Errorf("accelerated/blackcl: failed to create buffer: %w", err)
+		return nil, errChan
+	}
+
+	go func() {
+		if err := <-buffer.Copy(vals); err != nil {
+			errChan <- fmt.Errorf("accelerated/blackcl: failed to copy buffer: %w", err)
+		} else {
+			errChan <- nil
+		}
+
+		close(errChan)
+	}()
+
+	return buffer, errChan
+}
+
+// BufferSize asynchronously buffers a slice of float32s onto the device.
+func (o *OpenCL) BufferSize(len int) (*blackcl.Vector, error) {
+	buffer, err := o.device.NewVector(len)
+	if err != nil {
+		return nil, fmt.Errorf("accelerated/blackcl: failed to create buffer: %w", err)
+	}
+
+	return buffer, nil
+}
+
 // MatMul implements opencl.OpenCL.
 func (o *OpenCL) MatMul(xout []float32, x []float32, w []float32, n int, d int) error {
 	if len(xout) != d {
 		return fmt.Errorf("accelerated/blackcl: xout length must be %d, got %d", d, len(xout))
 	}
 
-	xoutDev, err := o.Buffer("xout", len(xout))
+	xoutDev, err := o.AllocBuffer("xout", len(xout))
 	if err != nil {
 		return fmt.Errorf("accelerated/blackcl: failed to create xout device vector: %w", err)
 	}
 
-	xDev, err := o.Buffer("x", len(x))
+	xDev, err := o.AllocBuffer("x", len(x))
 	if err != nil {
 		return fmt.Errorf("accelerated/blackcl: failed to create x device vector: %w", err)
 	}
 
 	xDevCopyComplete := xDev.Copy(x)
 
-	wDev, err := o.Buffer("w", len(w))
+	wDev, err := o.AllocBuffer("w", len(w))
 	if err != nil {
 		return fmt.Errorf("accelerated/blackcl: failed to create w device vector: %w", err)
 	}
@@ -95,16 +130,8 @@ func (o *OpenCL) MatMul(xout []float32, x []float32, w []float32, n int, d int) 
 		return fmt.Errorf("accelerated/blackcl: failed to copy w to device: %w", err)
 	}
 
-	globalSize := d
-	localSize := 1
-
-	if globalSize%localGroupSize != 0 {
-		globalSize /= localGroupSize
-		localSize = localGroupSize
-	}
-
-	if err = <-o.kernel.Global(globalSize).Local(localSize).Run(xoutDev, xDev, wDev, uint32(n)); err != nil {
-		return fmt.Errorf("accelerated/blackcl: failed to run kernel: %w", err)
+	if err := <-o.MatMulDevMem(xoutDev, xDev, wDev, n, d); err != nil {
+		return err
 	}
 
 	xoutHost, err := xoutDev.Data()
@@ -117,6 +144,28 @@ func (o *OpenCL) MatMul(xout []float32, x []float32, w []float32, n int, d int) 
 	}
 
 	return nil
+}
+
+func (o *OpenCL) MatMulDevMem(xout *blackcl.Vector, x *blackcl.Vector, w *blackcl.Vector, n int, d int) <-chan error {
+	globalSize := d
+	localSize := 1
+
+	if globalSize%localGroupSize != 0 {
+		globalSize /= localGroupSize
+		localSize = localGroupSize
+	}
+
+	errChan := make(chan error, 1)
+
+	go func() {
+		if err := <-o.kernel.Global(globalSize).Local(localSize).Run(xout, x, w, uint32(n)); err != nil {
+			errChan <- fmt.Errorf("accelerated/blackcl: failed to run matmul: %w", err)
+		} else {
+			errChan <- nil
+		}
+	}()
+
+	return errChan
 }
 
 // SetupContext implements opencl.OpenCL.

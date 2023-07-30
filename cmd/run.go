@@ -12,9 +12,9 @@ import (
 	"runtime/pprof"
 	"time"
 
-	"github.com/haormj/llama2/accelerated"
-	"github.com/haormj/llama2/accelerated/blackcl"
+	"github.com/haormj/llama2/accelerated/opencl"
 	"github.com/spf13/cobra"
+	"gitlab.com/microo8/blackcl"
 )
 
 var runCmd = &cobra.Command{
@@ -285,7 +285,7 @@ type RunState struct {
 	key_cache   []float32 // (layer, seq_len, dim)
 	value_cache []float32 // (layer, seq_len, dim)
 
-	backend accelerated.Backend
+	backend *opencl.OpenCL
 }
 
 func NewRunState(p *Config) *RunState {
@@ -302,7 +302,7 @@ func NewRunState(p *Config) *RunState {
 		logits:      make([]float32, p.vocab_size),
 		key_cache:   make([]float32, p.n_layers*p.seq_len*p.dim),
 		value_cache: make([]float32, p.n_layers*p.seq_len*p.dim),
-		backend:     blackcl.New(),
+		backend:     opencl.New(),
 	}
 }
 
@@ -353,6 +353,12 @@ func (rs *RunState) matmul(xout, x, w []float32, n, d int) {
 	}
 }
 
+func (rs *RunState) matmulDevMem(xout, x, w *blackcl.Vector, n, d int) {
+	if err := rs.backend.MatMulDevMem(xout, x, w, n, d); err != nil {
+		panic(err)
+	}
+}
+
 func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) {
 	// a few convenience variables
 	x := s.x
@@ -370,14 +376,89 @@ func transformer(token, pos int, p *Config, s *RunState, w *TransformerWeights) 
 
 	// forward all the layers
 	for l := 0; l < int(p.n_layers); l++ {
-
 		// attention rmsnorm
 		rmsnorm(s.xb, x, w.rms_att_weight[l*dim:], dim)
 
+		sxb, sxbErr := s.backend.Buffer(s.xb)
+
+		wwq, wwqErr := s.backend.Buffer(w.wq[l*dim*dim:])
+		sq, sqErr := s.backend.BufferSize(len(s.q))
+		if sqErr != nil {
+			panic(sqErr)
+		}
+
+		wwk, wwkErr := s.backend.Buffer(w.wk[l*dim*dim:])
+		sk, skErr := s.backend.BufferSize(len(s.k))
+		if skErr != nil {
+			panic(skErr)
+		}
+
+		wwv, wwvErr := s.backend.Buffer(w.wv[l*dim*dim:])
+		sv, svErr := s.backend.BufferSize(len(s.v))
+		if svErr != nil {
+			panic(svErr)
+		}
+
+		if err := <-sxbErr; err != nil {
+			panic(err)
+		}
+
 		// qkv matmuls for this position
-		s.matmul(s.q, s.xb, w.wq[l*dim*dim:], dim, dim)
-		s.matmul(s.k, s.xb, w.wk[l*dim*dim:], dim, dim)
-		s.matmul(s.v, s.xb, w.wv[l*dim*dim:], dim, dim)
+		if err := <-wwqErr; err != nil {
+			panic(err)
+		}
+
+		qMul := s.backend.MatMulDevMem(sq, sxb, wwq, dim, dim)
+
+		if err := <-wwkErr; err != nil {
+			panic(err)
+		}
+
+		kMul := s.backend.MatMulDevMem(sk, sxb, wwk, dim, dim)
+
+		if err := <-wwvErr; err != nil {
+			panic(err)
+		}
+
+		vMul := s.backend.MatMulDevMem(sv, sxb, wwv, dim, dim)
+
+		if err := <-qMul; err != nil {
+			panic(err)
+		}
+
+		wwq.Release()
+
+		var err error
+		if s.q, err = sq.Data(); err != nil {
+			panic(err)
+		}
+
+		sq.Release()
+
+		if err := <-kMul; err != nil {
+			panic(err)
+		}
+
+		wwk.Release()
+
+		if s.k, err = sk.Data(); err != nil {
+			panic(err)
+		}
+
+		sk.Release()
+
+		if err := <-vMul; err != nil {
+			panic(err)
+		}
+
+		sxb.Release()
+		wwv.Release()
+
+		if s.v, err = sv.Data(); err != nil {
+			panic(err)
+		}
+
+		sv.Release()
 
 		// apply RoPE rotation to the q and k vectors for each head
 		for h := 0; h < int(p.n_heads); h++ {
